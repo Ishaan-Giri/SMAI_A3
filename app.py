@@ -4,11 +4,16 @@ A Streamlit RAG chatbot backed by official SEBI educational PDFs.
 """
 
 import os
+
+# Fix protobuf compatibility on Streamlit Cloud (must be set before any proto imports)
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
 import streamlit as st
 from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
+
 
 # ── Page config (must be FIRST Streamlit call) ────────────────────────────────
 st.set_page_config(
@@ -22,6 +27,16 @@ st.set_page_config(
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+/* === Force dark mode — override any light theme switching === */
+:root,
+[data-theme="light"],
+[data-theme="dark"] {
+    --background-color: #0D1B2A !important;
+    --secondary-background-color: #0F2133 !important;
+    --text-color: #CBD5E1 !important;
+    --primary-color: #00C2CB !important;
+}
 
 /* === Base === */
 html, body, [class*="css"] {
@@ -357,26 +372,49 @@ hr {
     color: #38DDE8 !important;
 }
 
-/* === Sidebar brand === */
+/* === Sidebar brand — two-line stacked === */
 .sidebar-brand {
     display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-bottom: 4px;
+    align-items: flex-start;
+    gap: 12px;
+    margin-bottom: 6px;
+    padding: 4px 0;
 }
-.sidebar-brand .brand-icon { font-size: 1.6rem; }
-.sidebar-brand .brand-name {
-    font-size: 1.08rem;
-    font-weight: 700;
+.sidebar-brand .brand-bar {
+    width: 3px;
+    height: 48px;
+    background: linear-gradient(180deg, #00C2CB 0%, #0077B6 100%);
+    border-radius: 2px;
+    flex-shrink: 0;
+    margin-top: 2px;
+}
+.sidebar-brand .brand-text {
+    display: flex;
+    flex-direction: column;
+    line-height: 1.1;
+}
+.sidebar-brand .brand-sebi {
+    font-size: 1.5rem;
+    font-weight: 800;
     color: #F1F5F9 !important;
+    letter-spacing: -0.5px;
+}
+.sidebar-brand .brand-assistant {
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: #64748B !important;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
 }
 .sidebar-section-label {
-    font-size: 0.68rem;
+    font-size: 0.65rem;
     font-weight: 700;
-    letter-spacing: 1.3px;
+    letter-spacing: 1.4px;
     text-transform: uppercase;
-    color: #475569 !important;
-    margin: 20px 0 7px 0;
+    color: #334155 !important;
+    margin: 22px 0 8px 0;
+    padding-bottom: 5px;
+    border-bottom: 1px solid #1E3A52;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -408,6 +446,25 @@ PDF_INFO = {
     "corporatebonds.pdf":                                      ("Corporate Bonds Market Guide",               "Corporate Bonds"),
     "primarymarkets.pdf":                                      ("Introduction to Primary Markets",            "Primary Market"),
 }
+
+
+# ── Auto-ingest on startup (needed for Streamlit Cloud where chroma_db isn't committed) ──
+@st.cache_resource(show_spinner="📚 Building knowledge base from SEBI PDFs…")
+def ensure_ingested():
+    """Run ingestion if the chroma_db collection doesn't exist yet."""
+    from pathlib import Path
+    import chromadb
+    chroma_dir = Path(__file__).parent / "chroma_db"
+    try:
+        client = chromadb.PersistentClient(path=str(chroma_dir))
+        client.get_collection("sebi_docs")
+        return  # already exists
+    except Exception:
+        pass  # need to ingest
+    from ingest import ingest
+    ingest()
+
+ensure_ingested()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -467,24 +524,17 @@ if "pending_query" not in st.session_state: st.session_state.pending_query = Non
 with st.sidebar:
     st.markdown("""
 <div class="sidebar-brand">
-  <span class="brand-icon">📊</span>
-  <span class="brand-name">SEBI Assistant</span>
+  <div class="brand-bar"></div>
+  <div class="brand-text">
+    <span class="brand-sebi">SEBI</span>
+    <span class="brand-assistant">Assistant</span>
+  </div>
 </div>
 """, unsafe_allow_html=True)
-    st.caption("RAG helpdesk for retail investors · powered by Gemini")
-
-    # — API Key —
-    st.markdown('<div class="sidebar-section-label">API Key</div>', unsafe_allow_html=True)
-    env_key = os.getenv("GOOGLE_API_KEY", "").strip()
-    if env_key:
-        key_preview = f"{env_key[:5]}..." if len(env_key) > 5 else f"{env_key}..."
-        st.success(f"✅ Active key: `{key_preview}`")
-    else:
-        st.warning("⚠️ No API key found in `.env`.")
 
     # — Language toggle —
     st.markdown('<div class="sidebar-section-label">Language</div>', unsafe_allow_html=True)
-    hindi_mode = st.toggle("🇮🇳 Respond in Hindi", value=False, key="hindi_toggle")
+    hindi_mode = st.toggle("Respond in Hindi", value=False, key="hindi_toggle")
 
     # — Knowledge base status —
     st.markdown('<div class="sidebar-section-label">Knowledge Base</div>', unsafe_allow_html=True)
@@ -492,26 +542,26 @@ with st.sidebar:
     pdf_files = sorted(pdf_dir.glob("*.pdf"))
 
     if pdf_files:
-        st.success(f"📚 {len(pdf_files)} SEBI PDFs loaded")
+        st.success(f"{len(pdf_files)} SEBI documents loaded")
         with st.expander("View loaded documents", expanded=False):
             for p in pdf_files:
                 info  = PDF_INFO.get(p.name)
                 title = info[0] if info else p.stem.replace("_", " ").title()
-                st.write(f"• {title}")
+                st.write(f"  {title}")
     else:
-        st.error("❌ No PDFs found. Run `python ingest.py` first.")
+        st.error("No PDFs found. Run ingest.py first.")
 
     # — Clear chat —
     st.markdown('<div class="sidebar-section-label">Actions</div>', unsafe_allow_html=True)
-    if st.button("🗑️  Clear Chat History", use_container_width=True):
+    if st.button("Clear Chat History", use_container_width=True):
         st.session_state.messages     = []
         st.session_state.chat_history = []
         st.rerun()
 
     # — Disclaimer —
-    st.markdown('<div style="margin-top:24px;"></div>', unsafe_allow_html=True)
+    st.markdown('<div style="margin-top:28px;"></div>', unsafe_allow_html=True)
     st.caption(
-        "📌 For educational use only. Verify final details on "
+        "For educational use only. Verify final details on "
         "[sebi.gov.in](https://www.sebi.gov.in) or "
         "[investor.sebi.gov.in](https://investor.sebi.gov.in)."
     )
@@ -522,7 +572,7 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="header-card">
-  <div class="header-badge">📋 Official SEBI Documents · RAG Powered</div>
+  <div class="header-badge">Official SEBI Documents &middot; RAG Powered</div>
   <h1>SEBI Retail Investor Assistant</h1>
   <p>Ask about IPOs, KYC, mutual funds, grievances, and investor rights.
      Every answer cites official SEBI PDFs with page references.</p>
@@ -530,9 +580,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── Suggested questions (only when chat is empty) ─────────────────────────────
-if not st.session_state.messages:
-    st.caption("✨ Try one of these questions:")
+# ── Suggested questions (hide when chat started OR a question is pending) ────
+if not st.session_state.messages and not st.session_state.pending_query:
+    st.caption("Try one of these questions:")
     cols = st.columns(2)
     for i, q in enumerate(SUGGESTIONS):
         with cols[i % 2]:
