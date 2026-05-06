@@ -38,7 +38,8 @@ SYSTEM_PROMPT = (
     "8. Be friendly, clear, and accessible to a non-expert Indian investor."
 )
 
-HINDI_SUFFIX = "\n\nIMPORTANT: Please respond entirely in Hindi (Devanagari script)."
+HINDI_SUFFIX   = "\n\nIMPORTANT: You MUST respond entirely in Hindi (Devanagari script). Do not use English."
+ENGLISH_SUFFIX = "\n\nIMPORTANT: You MUST respond entirely in English, regardless of any previous messages."
 
 
 class SEBIAssistant:
@@ -87,8 +88,13 @@ class SEBIAssistant:
                 "Get a free key at https://aistudio.google.com"
             )
         self._genai_client = genai.Client(api_key=api_key)
-        # Model fallback: try in order until one has quota
+        # Model fallback: ordered by free-tier daily quota (highest first)
+        # gemini-1.5-flash     : ~1500 req/day free
+        # gemini-2.0-flash-lite: ~200  req/day free
+        # gemini-2.0-flash     : ~200  req/day free
+        # gemini-2.5-flash     : ~20   req/day free
         self._model_candidates = [
+            "gemini-1.5-flash",
             "gemini-2.0-flash-lite",
             "gemini-2.0-flash",
             "gemini-2.5-flash",
@@ -175,8 +181,9 @@ class SEBIAssistant:
             f"Context from SEBI official documents:\n\n{context}\n\n"
             f"Question: {query}"
         )
-        if hindi:
-            user_message += HINDI_SUFFIX
+        # Always inject an explicit language instruction so toggling mid-conversation
+        # doesn't leave the model following the previous language from chat history.
+        user_message += HINDI_SUFFIX if hindi else ENGLISH_SUFFIX
 
         # Build conversation history for the new SDK
         contents = []
@@ -193,10 +200,12 @@ class SEBIAssistant:
         )
 
         # Try models in order; retry transient errors (503/429) with backoff
-        last_error = None
+        last_error  = None
         MAX_RETRIES = 3
+        answer_text = None  # will be set on success
 
         def _is_retryable(err_str: str) -> bool:
+            """Quota/rate errors: retry with backoff on the same model."""
             return (
                 "429" in err_str
                 or "503" in err_str
@@ -206,7 +215,17 @@ class SEBIAssistant:
                 or "unavailable" in err_str.lower()
             )
 
+        def _skip_model(err_str: str) -> bool:
+            """Model not found / not supported for this key: skip silently."""
+            return (
+                "404" in err_str
+                or "NOT_FOUND" in err_str
+                or "not found" in err_str.lower()
+                or "not supported" in err_str.lower()
+            )
+
         for model_name in self._model_candidates:
+            success = False
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
                     response = self._genai_client.models.generate_content(
@@ -219,23 +238,29 @@ class SEBIAssistant:
                         ),
                     )
                     answer_text = response.text
-                    last_error = None  # clear on success
-                    break  # inner loop — success
+                    last_error  = None
+                    success     = True
+                    break                       # got answer — exit inner loop
                 except Exception as e:
                     err_str = str(e)
-                    if _is_retryable(err_str):
+                    if _skip_model(err_str):
+                        last_error = e
+                        break                   # model unavailable — try next
+                    elif _is_retryable(err_str):
                         last_error = e
                         if attempt < MAX_RETRIES:
-                            time.sleep(2 ** attempt)  # 2s, 4s backoff
-                        # exhaust retries → try next model
+                            time.sleep(2 ** attempt)   # 2 s, 4 s back-off
+                        # else: fall through to next attempt, which ends loop
                     else:
-                        raise  # non-retryable error — bubble up immediately
-            else:
-                continue  # all retries for this model failed → next model
-            break          # inner loop succeeded → exit outer loop
-        else:
+                        raise                   # non-retryable — bubble up
+            if success:
+                break                           # have answer — exit outer loop
+            # else: try next model
+
+        if answer_text is None:
             raise RuntimeError(
-                f"All Gemini models are temporarily unavailable. Last error: {last_error}\n"
+                f"All Gemini models are temporarily unavailable. "
+                f"Last error: {last_error}\n"
                 "Please wait a moment and try again."
             )
 
